@@ -137,7 +137,7 @@ def _offload_clip_patcher_to_cpu(clip_obj) -> None:
     mm.soft_empty_cache()
 
 def _find_or_download_gemma_path():
-    """Return a local path to the default Gemma safetensors.
+    """Return a local path to the default Gemma text encoder.
 
     Resolution order:
       1. User preference set in ComfyUI Settings → DramaBox → Default Text Encoder.
@@ -147,29 +147,55 @@ def _find_or_download_gemma_path():
     To use a different model per-workflow, connect a DramaBox CLIP Loader node.
     """
     import shutil
+    _fp = None
     try:
         import folder_paths as _fp
         te_dirs = _fp.get_folder_paths("text_encoders")
     except Exception:
         te_dirs = [os.path.join(_MODELS_DIR, "text_encoders")]
 
+    gguf_dirs = []
+    if _fp is not None:
+        for key in ("clip_gguf", "clip"):
+            try:
+                gguf_dirs.extend(_fp.get_folder_paths(key))
+            except Exception:
+                pass
+
+    # Keep order stable and remove duplicates.
+    all_dirs = list(dict.fromkeys(te_dirs + gguf_dirs))
+
     # 1. User preference from ComfyUI settings
     preferred = (_get_dramabox_setting("DramaBox.defaultTextEncoder") or "").strip()
     if preferred:
-        # Allow omitting the .safetensors extension
-        if not os.path.splitext(preferred)[1]:
-            preferred = preferred + ".safetensors"
+        stem, ext = os.path.splitext(preferred)
+        preferred_names = [preferred] if ext else [stem + ".safetensors", stem + ".gguf"]
+
         import glob as _glob
-        for folder in te_dirs:
-            # Exact flat match first
-            candidate = os.path.join(folder, preferred)
-            if os.path.isfile(candidate):
-                return candidate
-            # Recursive search in subfolders
-            matches = _glob.glob(os.path.join(folder, "**", preferred), recursive=True)
-            if matches:
-                return matches[0]
-        print(f"[DramaBox] Warning: preferred text encoder '{preferred}' not found — falling back to default.")
+        for preferred_name in preferred_names:
+            # Exact file-key lookup first.
+            if _fp is not None:
+                for key in ("text_encoders", "clip_gguf", "clip"):
+                    try:
+                        candidate = _fp.get_full_path(key, preferred_name)
+                    except Exception:
+                        candidate = None
+                    if candidate and os.path.isfile(candidate):
+                        return candidate
+
+            # Fallback recursive search in known directories.
+            for folder in all_dirs:
+                candidate = os.path.join(folder, preferred_name)
+                if os.path.isfile(candidate):
+                    return candidate
+                matches = _glob.glob(os.path.join(folder, "**", preferred_name), recursive=True)
+                if matches:
+                    return matches[0]
+
+        print(
+            f"[DramaBox] Warning: preferred text encoder '{preferred}' not found "
+            "(checked safetensors/gguf) — falling back to default."
+        )
 
     # 2. Default fp4 mixed file
     import glob as _glob

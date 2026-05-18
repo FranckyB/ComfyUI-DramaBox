@@ -289,7 +289,15 @@ class DramaBoxTEModel(torch.nn.Module):
     def load_sd(self, sd):
         # Gemma checkpoint — detected by a Gemma-specific key
         if "model.layers.47.self_attn.q_norm.weight" in sd:
-            return self.gemma3_12b.load_sd(sd)
+            missing, unexpected = self.gemma3_12b.load_sd(sd)
+            # DramaBox uses Gemma as a text-only encoder.  GGUF and safetensors
+            # exports of Gemma 3 12B omit the vision tower; filter those keys so
+            # ComfyUI doesn't log spurious "clip missing" warnings for them.
+            missing = [k for k in missing if not (
+                k.startswith("vision_model.") or
+                k.startswith("multi_modal_projector.")
+            )]
+            return (missing, unexpected)
 
         if self.embeddings_processor is None:
             return ([], [])
@@ -382,6 +390,87 @@ def _list_audio_component_files():
     return result
 
 
+def _safe_filename_list(key: str) -> list[str]:
+    try:
+        return list(folder_paths.get_filename_list(key))
+    except Exception:
+        return []
+
+
+def _get_gemma_model_choices() -> list[str]:
+    """Return selectable Gemma model filenames (safetensors + optional gguf).
+
+    Only files whose basename contains 'gemma' (case-insensitive) are included
+    so that unrelated text encoders (T5, CLIP-L, LTX projectors, …) don't
+    clutter the dropdown.  Searched across text_encoders, clip_gguf, and clip
+    so that files stored in any of these ComfyUI folders are found.
+    """
+    names: set[str] = set()
+    for name in _safe_filename_list("text_encoders"):
+        if "gemma" in name.lower():
+            names.add(name)
+    for key in ("clip_gguf", "clip"):
+        for name in _safe_filename_list(key):
+            if "gemma" in name.lower():
+                names.add(name)
+    return sorted(names, key=str.casefold)
+
+
+def _resolve_gemma_model_path(gemma_model: str) -> str:
+    """Resolve a Gemma model name or absolute path across known Comfy folders."""
+    if os.path.isabs(gemma_model) and os.path.isfile(gemma_model):
+        return gemma_model
+
+    for key in ("text_encoders", "clip_gguf", "clip"):
+        try:
+            p = folder_paths.get_full_path(key, gemma_model)
+        except Exception:
+            p = None
+        if p and os.path.isfile(p):
+            return p
+
+    # Keep legacy behavior for existing workflows that assume text_encoders key.
+    return folder_paths.get_full_path_or_raise("text_encoders", gemma_model)
+
+
+def _discover_gguf_bridge():
+    """Find ComfyUI-GGUF symbols if the extension is installed and loaded."""
+    gguf_clip_loader = None
+    gguf_ops = None
+    gguf_model_patcher = None
+
+    for mod in tuple(sys.modules.values()):
+        if mod is None:
+            continue
+
+        # Avoid torch.ops dynamic namespaces (they pretend every attribute exists).
+        mod_name = str(getattr(mod, "__name__", ""))
+        mod_file = str(getattr(mod, "__file__", ""))
+        mod_hint = f"{mod_name} {mod_file}".lower()
+        if "gguf" not in mod_hint:
+            continue
+
+        if gguf_clip_loader is None and hasattr(mod, "gguf_clip_loader"):
+            candidate = getattr(mod, "gguf_clip_loader")
+            if callable(candidate) and candidate.__class__.__name__ != "_OpNamespace":
+                gguf_clip_loader = candidate
+
+        if gguf_ops is None and hasattr(mod, "GGMLOps"):
+            candidate = getattr(mod, "GGMLOps")
+            if candidate.__class__.__name__ != "_OpNamespace" and hasattr(candidate, "Embedding"):
+                gguf_ops = candidate
+
+        if gguf_model_patcher is None and hasattr(mod, "GGUFModelPatcher"):
+            candidate = getattr(mod, "GGUFModelPatcher")
+            if candidate.__class__.__name__ != "_OpNamespace" and hasattr(candidate, "clone"):
+                gguf_model_patcher = candidate
+
+        if gguf_clip_loader is not None and gguf_ops is not None and gguf_model_patcher is not None:
+            break
+
+    return gguf_clip_loader, gguf_ops, gguf_model_patcher
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Loader node
 # ─────────────────────────────────────────────────────────────────────────────
@@ -410,8 +499,13 @@ class DramaBoxTextEncoderLoader:
         return {
             "required": {
                 "gemma_model": (
-                    folder_paths.get_filename_list("text_encoders"),
-                    {"tooltip": "Gemma fp8/bf16 safetensors from ComfyUI/models/text_encoders/"},
+                    _get_gemma_model_choices(),
+                    {
+                        "tooltip": (
+                            "Gemma model from ComfyUI/models/text_encoders/ "
+                            "(safetensors or gguf when ComfyUI-GGUF is installed)."
+                        ),
+                    },
                 ),
             },
             "optional": {
@@ -426,10 +520,8 @@ class DramaBoxTextEncoderLoader:
         # ── mirror LTXAVTextEncoderLoader / load_text_encoder_state_dicts ──
         # Accept either a bare filename (from the dropdown) or a full absolute
         # path (when called programmatically from _load_text_encoder).
-        if os.path.isabs(gemma_model) and os.path.isfile(gemma_model):
-            gemma_path = gemma_model
-        else:
-            gemma_path = folder_paths.get_full_path_or_raise("text_encoders", gemma_model)
+        gemma_path = _resolve_gemma_model_path(gemma_model)
+        is_gemma_gguf = gemma_path.lower().endswith(".gguf")
 
         audio_path = self._find_audio_components()
         if audio_path is None:
@@ -444,8 +536,25 @@ class DramaBoxTextEncoderLoader:
         if device == "cpu":
             model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
 
-        # Load both state dicts using the same safe_load path as comfy.sd.load_clip.
-        gemma_sd, _ = comfy.utils.load_torch_file(gemma_path, safe_load=True, return_metadata=True)
+        # Load Gemma state dict from safetensors or GGUF.
+        gguf_model_patcher = None
+        if is_gemma_gguf:
+            gguf_clip_loader, gguf_ops, gguf_model_patcher = _discover_gguf_bridge()
+            if gguf_clip_loader is None or gguf_ops is None:
+                raise RuntimeError(
+                    "[DramaBox] Selected Gemma GGUF model but ComfyUI-GGUF is not available.\n"
+                    "Install ComfyUI-GGUF and restart ComfyUI, or select a safetensors Gemma model."
+                )
+            if not callable(gguf_clip_loader):
+                raise RuntimeError(
+                    f"[DramaBox] Invalid GGUF bridge: gguf_clip_loader is not callable ({type(gguf_clip_loader)})."
+                )
+            gemma_sd = gguf_clip_loader(gemma_path)
+            model_options["custom_operations"] = gguf_ops
+        else:
+            gemma_sd, _ = comfy.utils.load_torch_file(gemma_path, safe_load=True, return_metadata=True)
+
+        # Audio components remain safetensors for DramaBox at this time.
         audio_sd, _ = comfy.utils.load_torch_file(audio_path, safe_load=True, return_metadata=True)
 
         # Mirror comfy.sd.load_clip quant conversion behavior.
@@ -493,6 +602,11 @@ class DramaBoxTextEncoderLoader:
             state_dict=clip_data,
             model_options=model_options,
         )
+        if is_gemma_gguf and gguf_model_patcher is not None:
+            try:
+                clip.patcher = gguf_model_patcher.clone(clip.patcher)
+            except Exception as e:
+                logger.debug("[DramaBox] GGUF patcher clone skipped: %s", e)
         return (clip,)
 
     @staticmethod

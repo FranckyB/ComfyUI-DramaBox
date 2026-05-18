@@ -163,8 +163,9 @@ app.registerExtension({
             type: "text",
             defaultValue: "",
             tooltip:
-                "Filename of the Gemma safetensors to auto-load (must exist in your " +
-                "text_encoders folder). Leave blank to use gemma_3_12B_it_fp4_mixed.safetensors " +
+                "Filename of the Gemma text encoder to auto-load (.safetensors or .gguf). " +
+                "File must exist in your text_encoders folder (or clip_gguf when available). " +
+                "Leave blank to use gemma_3_12B_it_fp4_mixed.safetensors " +
                 "(downloaded automatically on first use). Connect a DramaBox CLIP Loader node " +
                 "to override per-workflow.",
         },

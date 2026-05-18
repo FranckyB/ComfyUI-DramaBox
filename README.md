@@ -7,7 +7,7 @@ ComfyUI custom nodes for [DramaBox](https://github.com/resemble-ai/DramaBox) —
 | Node | Description |
 |------|-------------|
 | **DramaBox TTS** | Generates speech audio from a text prompt. Optionally accepts a voice reference clip and advanced options. All model weights are downloaded automatically on first use. |
-| **DramaBox CLIP Loader** | Loads a Gemma text encoder from your `text_encoders` folder. (Optional) Connect to the TTS node's `dramabox_clip` input to override the default encoder. |
+| **DramaBox CLIP Loader** | Loads a Gemma text encoder from your `text_encoders` folder. Supports `.safetensors` and optional `.gguf` (when ComfyUI-GGUF is installed). Connect to the TTS node's `dramabox_clip` input to override the default encoder. |
 | **DramaBox Options** | Advanced generation settings (steps, CFG scale, duration, memory policy, etc.). (Optional) Connect to the DramaBox TTS node's `options` input. |
 
 ## Text Encoder
@@ -16,7 +16,7 @@ DramaBox uses a Gemma 3 12B text encoder. By default the node loads **`gemma_3_1
 
 ### Changing the default encoder
 
-**Per-installation preference** — open *ComfyUI Settings → DramaBox → Default Text Encoder filename* and enter the filename of any Gemma safetensors already in your `text_encoders` folder (e.g. `gemma_3_12b_it_fp8_scaled.safetensors`). Leave it blank to keep the fp4 default.
+**Per-installation preference** — open *ComfyUI Settings → DramaBox → Default Text Encoder filename* and enter a Gemma filename from your models folder. Supports `.safetensors` and `.gguf` (with ComfyUI-GGUF installed). If you omit the extension, DramaBox tries `.safetensors` first, then `.gguf`. Leave it blank to keep the fp4 default.
 
 **Memory preference** — open *ComfyUI Settings → DramaBox → Memory* and keep **Automatic model offload (text encoder + post-generate)** enabled (default). This does two things automatically:
 
@@ -25,7 +25,7 @@ DramaBox uses a Gemma 3 12B text encoder. By default the node loads **`gemma_3_1
 
 If you have plenty of VRAM and prefer maximum throughput, you can disable this preference to keep models resident on GPU.
 
-**Per-workflow override** — add a **DramaBox CLIP Loader** node, select the model you want, and connect its output to the TTS node's `dramabox_clip` input. This takes precedence over the global preference and lets you switch encoders between workflows without touching settings.
+**Per-workflow override** — add a **DramaBox CLIP Loader** node, select the model you want (`.safetensors` or optional `.gguf`), and connect its output to the TTS node's `dramabox_clip` input. This takes precedence over the global preference and lets you switch encoders between workflows without touching settings.
 
 ### Post-generate memory policy (Options node)
 
@@ -90,7 +90,7 @@ Voice LoRAs for DramaBox can be trained with **[Voice Clone Studio — DramaBox 
 ### May 2026
 - **Text encoder overhaul** — DramaBox now uses ComfyUI's standard CLIP infrastructure for the Gemma text encoder, matching the native LTX-2 loading path for correct VRAM management.
 - **Default encoder** — switched to `gemma_3_12B_it_fp4_mixed.safetensors` (ComfyUI/Comfy-Org's own quantized file, ~8 GB vs ~24 GB for the previous bnb-4bit snapshot). Downloaded automatically into `text_encoders/` on first use if not already present.
-- **DramaBox CLIP Loader node** — new optional node to load any Gemma safetensors from `text_encoders/`. Connect to the TTS node's `dramabox_clip` input for per-workflow encoder selection.
+- **DramaBox CLIP Loader node** — optional node to load Gemma text encoders from `text_encoders/` (safetensors) and GGUF files when ComfyUI-GGUF is installed. Connect to the TTS node's `dramabox_clip` input for per-workflow encoder selection.
 - **Settings preference** — added *ComfyUI Settings → DramaBox → Default Text Encoder filename* to set a global default without needing a CLIP Loader node in every workflow.
 - **Old Gemma snapshot cleanup** — the large `gemma-3-12b-it-bnb-4bit/` model directory (previously downloaded into `models/dramabox/`) is automatically removed on startup since it is no longer needed.
 - **Removed info output** — the `info` string output has been removed from the DramaBox TTS node.
